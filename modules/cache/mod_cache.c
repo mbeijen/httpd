@@ -35,6 +35,7 @@ static ap_filter_rec_t *cache_out_filter_handle;
 static ap_filter_rec_t *cache_out_subreq_filter_handle;
 static ap_filter_rec_t *cache_remove_url_filter_handle;
 static ap_filter_rec_t *cache_invalidate_filter_handle;
+static ap_filter_rec_t *cache_query_replay_filter_handle;
 
 /**
  * Entity headers' names
@@ -153,6 +154,20 @@ static int cache_quick_handler(request_rec *r, int lookup)
                 r->connection);
 
         return DECLINED;
+    }
+    case M_QUERY: {
+        /* RFC 10008, Section 2.7: the key incorporates the content */
+        if (!conf->query || lookup || r->main) {
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r,
+                          APLOGNO(10687) "cache: QUERY not cached (see "
+                          "CacheQuery), ignoring: %s", r->uri);
+            return DECLINED;
+        }
+        if (cache_query_key(cache, r, conf,
+                            cache_query_replay_filter_handle) != OK) {
+            return DECLINED;
+        }
+        break;
     }
     case M_GET: {
         break;
@@ -453,6 +468,20 @@ static int cache_handler(request_rec *r)
                 r->connection);
 
         return DECLINED;
+    }
+    case M_QUERY: {
+        /* RFC 10008, Section 2.7: the key incorporates the content */
+        if (!conf->query || r->main) {
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r,
+                          APLOGNO(10688) "cache: QUERY not cached (see "
+                          "CacheQuery), ignoring: %s", r->uri);
+            return DECLINED;
+        }
+        if (cache_query_key(cache, r, conf,
+                            cache_query_replay_filter_handle) != OK) {
+            return DECLINED;
+        }
+        break;
     }
     case M_GET: {
         break;
@@ -1834,6 +1863,16 @@ static int cache_status(cache_handle_t *h, request_rec *r,
 }
 
 /**
+ * Internal redirects keep the protocol input filters only. Hand the QUERY
+ * content that was read for the cache key on to the handler of the
+ * redirected request as well.
+ */
+static void cache_insert_filter(request_rec *r)
+{
+    cache_query_replay_insert(r, cache_query_replay_filter_handle);
+}
+
+/**
  * If an error has occurred, but we have a stale cached entry, restore the
  * filter stack from the save filter onwards. The canned error message will
  * be discarded in the process, and replaced with the cached response.
@@ -2033,6 +2072,8 @@ static void * create_cache_config(apr_pool_t *p, server_rec *s)
     ps->lockmaxage = apr_time_from_sec(DEFAULT_CACHE_MAXAGE);
     ps->x_cache = DEFAULT_X_CACHE;
     ps->x_cache_detail = DEFAULT_X_CACHE_DETAIL;
+    ps->query = 0;
+    ps->query_maxbody = DEFAULT_CACHE_QUERY_MAXBODY;
     return ps;
 }
 
@@ -2095,6 +2136,17 @@ static void * merge_cache_config(apr_pool_t *p, void *basev, void *overridesv)
         (overrides->base_uri_set == 0)
         ? base->base_uri
         : overrides->base_uri;
+    ps->query =
+        (overrides->query_set == 0)
+        ? base->query
+        : overrides->query;
+    ps->query_set = base->query_set || overrides->query_set;
+    ps->query_maxbody =
+        (overrides->query_maxbody_set == 0)
+        ? base->query_maxbody
+        : overrides->query_maxbody;
+    ps->query_maxbody_set = base->query_maxbody_set
+                            || overrides->query_maxbody_set;
     return ps;
 }
 
@@ -2430,6 +2482,36 @@ static const char *set_cache_lock_maxage(cmd_parms *parms, void *dummy,
     return NULL;
 }
 
+static const char *set_cache_query(cmd_parms *parms, void *dummy, int flag)
+{
+    cache_server_conf *conf;
+
+    conf =
+        (cache_server_conf *)ap_get_module_config(parms->server->module_config,
+                                                  &cache_module);
+    conf->query = flag;
+    conf->query_set = 1;
+    return NULL;
+}
+
+static const char *set_cache_query_maxbody(cmd_parms *parms, void *dummy,
+                                           const char *arg)
+{
+    cache_server_conf *conf;
+    apr_off_t size;
+    char *end;
+
+    conf =
+        (cache_server_conf *)ap_get_module_config(parms->server->module_config,
+                                                  &cache_module);
+    if (apr_strtoff(&size, arg, &end, 10) || *end || size <= 0) {
+        return "CacheQueryMaxBodySize must be a positive number of bytes";
+    }
+    conf->query_maxbody = size;
+    conf->query_maxbody_set = 1;
+    return NULL;
+}
+
 static const char *set_cache_x_cache(cmd_parms *parms, void *dummy, int flag)
 {
 
@@ -2585,6 +2667,12 @@ static const command_rec cache_cmds[] =
                   "DefaultRuntimeDir setting."),
     AP_INIT_TAKE1("CacheLockMaxAge", set_cache_lock_maxage, NULL, RSRC_CONF,
                   "Maximum age of any thundering herd lock."),
+    AP_INIT_FLAG("CacheQuery", set_cache_query, NULL, RSRC_CONF,
+                 "Cache responses to QUERY requests (RFC 10008), default off"),
+    AP_INIT_TAKE1("CacheQueryMaxBodySize", set_cache_query_maxbody, NULL,
+                  RSRC_CONF,
+                  "Largest QUERY request content in bytes that is buffered "
+                  "to compute the cache key, default 65536"),
     AP_INIT_FLAG("CacheHeader", set_cache_x_cache, NULL, RSRC_CONF | ACCESS_CONF,
                  "Add a X-Cache header to responses. Default is off."),
     AP_INIT_FLAG("CacheDetailHeader", set_cache_x_cache_detail, NULL,
@@ -2609,6 +2697,7 @@ static void register_hooks(apr_pool_t *p)
     cache_hook_cache_status(cache_status, NULL, NULL, APR_HOOK_MIDDLE);
     /* cache error handler */
     ap_hook_insert_error_filter(cache_insert_error_filter, NULL, NULL, APR_HOOK_MIDDLE);
+    ap_hook_insert_filter(cache_insert_filter, NULL, NULL, APR_HOOK_MIDDLE);
     /* cache filters
      * XXX The cache filters need to run right after the handlers and before
      * any other filters. Consider creating AP_FTYPE_CACHE for this purpose.
@@ -2688,6 +2777,18 @@ static void register_hooks(apr_pool_t *p)
                                   cache_invalidate_filter,
                                   NULL,
                                   AP_FTYPE_PROTOCOL);
+    /* CACHE_QUERY_REPLAY hands QUERY content that was read for the cache
+     * key on to the handler. It sits right above the protocol filters,
+     * below any content filters (e.g. an inflating DEFLATE) that are
+     * inserted later and must see the content as received. It cannot be
+     * a protocol filter itself, as it would be added below HTTP_IN then;
+     * cache_insert_filter() carries it over an internal redirect.
+     */
+    cache_query_replay_filter_handle =
+        ap_register_input_filter("CACHE_QUERY_REPLAY",
+                                 cache_query_replay_filter,
+                                 NULL,
+                                 (ap_filter_type)(AP_FTYPE_PROTOCOL - 1));
     ap_hook_post_config(cache_post_config, NULL, NULL, APR_HOOK_REALLY_FIRST);
 }
 

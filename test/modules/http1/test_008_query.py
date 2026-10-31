@@ -1,5 +1,7 @@
 import os
 import socket
+import time
+import uuid
 
 import pytest
 
@@ -270,3 +272,71 @@ class TestAcceptQuery:
     def test_h1_008_26(self, env, value):
         r = _configtest(env, [value])
         assert r.exit_code == 0, f"{value}: {r}"
+
+
+# CacheQuery reads the content in the quick handler, before the request
+# is mapped to its per-directory configuration.
+class TestQueryCacheQuick:
+
+    @pytest.fixture(autouse=True, scope='class')
+    def _class_scope(self, env):
+        cache_dir = os.path.join(env.gen_dir, "query-cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        conf = H1Conf(env)
+        conf.add([
+            f'CacheRoot "{cache_dir}"',
+            'CacheEnable disk "/"',
+            "CacheQuery on",
+            "CacheQueryMaxBodySize 32",
+            "CacheHeader on",
+            f'<Directory "{env.server_docs_dir}/cgi">',
+            "  Options +FollowSymLinks",
+            "  RewriteEngine on",
+            "  RewriteRule ^rewritten$ query.py [L]",
+            "  LimitRequestBody 64",
+            "</Directory>",
+        ])
+        conf.add_vhost_cgi()
+        conf.install()
+        assert env.apache_restart() == 0
+
+    # the content survives an internal redirect to the handler
+    @pytest.mark.parametrize("path", ["/query.py", "/rewritten"])
+    def test_h1_008_30(self, env, path):
+        r = _query(env, path, body="select=surname")
+        assert r.exit_code == 0, f"{r}"
+        assert r.response["status"] == 200
+        assert r.json["body"] == "select=surname"
+
+    # content above CacheQueryMaxBodySize is handed on as well
+    @pytest.mark.parametrize("path", ["/query.py", "/rewritten"])
+    def test_h1_008_31(self, env, path):
+        body = "x" * 48
+        r = _query(env, path, body=body)
+        assert r.exit_code == 0, f"{r}"
+        assert r.response["status"] == 200
+        assert r.json["body"] == body
+
+    # the LimitRequestBody of the directory applies, whether the content
+    # was buffered for the cache key (chunked) or not (Content-Length)
+    @pytest.mark.parametrize("path", ["/query.py", "/rewritten"])
+    @pytest.mark.parametrize("headers", [[], ["Transfer-Encoding: chunked"]])
+    def test_h1_008_32(self, env, path, headers):
+        r = _query(env, path, body="x" * 100, headers=headers)
+        assert r.exit_code == 0, f"{r}"
+        assert r.response["status"] == 413
+        env.httpd_error_log.ignore_recent(lognos=["AH01270"])
+
+    # the cache key of a redirected QUERY incorporates its content
+    @pytest.mark.parametrize("path", ["/query.py", "/rewritten"])
+    def test_h1_008_33(self, env, path):
+        # a redirected QUERY is cached under the URL it is redirected to
+        a, b = uuid.uuid4().hex[:12], uuid.uuid4().hex[:12]
+        for body, cached in [(a, "MISS"), (a, "HIT"), (b, "MISS")]:
+            r = _query(env, path, body=body)
+            assert r.exit_code == 0, f"{r}"
+            assert r.response["status"] == 200
+            assert r.json["body"] == body
+            assert r.response["header"]["x-cache"].startswith(cached), f"{r}"
+            # let CACHE_SAVE commit the entry before the next request
+            time.sleep(0.1)

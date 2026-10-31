@@ -917,6 +917,73 @@ CacheLock on
 </directivesynopsis>
 
 <directivesynopsis>
+<name>CacheQuery</name>
+<description>Cache responses to QUERY requests</description>
+<syntax>CacheQuery On|Off</syntax>
+<default>CacheQuery Off</default>
+<contextlist><context>server config</context><context>virtual host</context>
+</contextlist>
+<compatibility>Available in version 2.5.1 and later.</compatibility>
+
+<usage>
+  <p>The <directive>CacheQuery</directive> directive enables caching of
+  responses to <code>QUERY</code> requests (<rfc>10008</rfc>). The response to a
+  QUERY depends on the request content, so the cache key of a QUERY is the
+  URL followed by a SHA-256 hash over the request's
+  <code>Content-Type</code>, <code>Content-Encoding</code>, and content.
+  Case and whitespace in the media type and the content coding names are
+  normalized; the content itself is used as received.</p>
+
+  <p>To compute the key, the cache reads the request content before the
+  handler runs, up to
+  <directive module="mod_cache">CacheQueryMaxBodySize</directive> bytes,
+  and then hands it on to the handler unchanged. A QUERY with larger
+  content, or without <code>Content-Type</code>, is not cached.</p>
+
+  <p>With <directive module="mod_cache">CacheQuickHandler</directive>
+  <code>On</code>, the content is read before the per-directory
+  configuration of the request is known. The
+  <directive module="core">LimitRequestBody</directive> of the server or
+  virtual host applies while reading, and that of the directory or
+  location when the content is handed on to the handler.</p>
+
+  <example>
+  <highlight language="config">
+CacheEnable disk "/api/"
+CacheQuery On
+  </highlight>
+  </example>
+
+  <note><title>Invalidation</title>
+  <p>A <code>POST</code>, <code>PUT</code>, or <code>DELETE</code> to a URL
+  invalidates the cached response to a <code>GET</code> of that URL, but
+  not cached responses to <code>QUERY</code>, as their keys cannot be
+  derived from the URL. They stay until they expire, so make sure that
+  the backend sends a suitable freshness lifetime.</p>
+  </note>
+</usage>
+</directivesynopsis>
+
+<directivesynopsis>
+<name>CacheQueryMaxBodySize</name>
+<description>The largest QUERY request content that is buffered to compute
+the cache key</description>
+<syntax>CacheQueryMaxBodySize <var>bytes</var></syntax>
+<default>CacheQueryMaxBodySize 65536</default>
+<contextlist><context>server config</context><context>virtual host</context>
+</contextlist>
+<compatibility>Available in version 2.5.1 and later.</compatibility>
+
+<usage>
+  <p>The <directive>CacheQueryMaxBodySize</directive> directive sets the
+  maximum size in bytes of the content of a <code>QUERY</code> request that
+  <directive module="mod_cache">CacheQuery</directive> buffers in memory to
+  compute the cache key. A QUERY with larger content is passed on without
+  being cached.</p>
+</usage>
+</directivesynopsis>
+
+<directivesynopsis>
   <name>CacheQuickHandler</name>
   <description>Run the cache from the quick handler.</description>
   <syntax>CacheQuickHandler <var>on|off</var></syntax>

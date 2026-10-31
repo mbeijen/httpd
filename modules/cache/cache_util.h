@@ -96,6 +96,7 @@ extern "C" {
 #define DEFAULT_X_CACHE_DETAIL  0
 #define DEFAULT_CACHE_STALE_ON_ERROR 1
 #define DEFAULT_CACHE_LOCKPATH "mod_cache-lock"
+#define DEFAULT_CACHE_QUERY_MAXBODY (64 * 1024)
 #define CACHE_LOCKNAME_KEY "mod_cache-lockname"
 #define CACHE_LOCKFILE_KEY "mod_cache-lockfile"
 #define CACHE_CTX_KEY "mod_cache-ctx"
@@ -126,6 +127,8 @@ typedef struct {
     const char *lockpath;
     apr_time_t lockmaxage;
     apr_uri_t *base_uri;
+    /** largest QUERY request content that is buffered for the cache key */
+    apr_off_t query_maxbody;
     /** ignore client's requests for uncached responses */
     unsigned int ignorecachecontrol:1;
     /** ignore query-string when caching */
@@ -153,6 +156,10 @@ typedef struct {
     unsigned int lockmaxage_set:1;
     unsigned int x_cache_set:1;
     unsigned int x_cache_detail_set:1;
+    /** cache responses to QUERY (RFC 10008) */
+    unsigned int query:1;
+    unsigned int query_set:1;
+    unsigned int query_maxbody_set:1;
 } cache_server_conf;
 
 typedef struct {
@@ -331,6 +338,39 @@ apr_table_t *cache_merge_headers_out(request_rec *r);
  * or the current/rewritable ones (r->uri/r->args).
  */
 int cache_use_early_url(request_rec *r);
+
+/**
+ * Compute the cache key of a QUERY (RFC 10008) request, which incorporates
+ * the request content and its metadata (Section 2.7): the URL key followed
+ * by a SHA-256 hash over Content-Type, Content-Encoding and the content.
+ *
+ * The content is buffered up to conf->query_maxbody bytes and replayed to
+ * the handler through the given input filter, whether or not the request
+ * turns out to be cacheable.
+ *
+ * @return OK with cache->key set, or DECLINED if the request cannot be
+ * cached (no Content-Type, content too large, or a read error).
+ */
+int cache_query_key(cache_request_rec *cache, request_rec *r,
+                    cache_server_conf *conf, ap_filter_rec_t *replay);
+
+/**
+ * Add the replay input filter again to a request that an internal
+ * redirect created, which drops all but the protocol input filters. To
+ * be called from the insert_filter hook.
+ */
+void cache_query_replay_insert(request_rec *r, ap_filter_rec_t *replay);
+
+/**
+ * Input filter that replays the QUERY content buffered by
+ * cache_query_key(), then passes on to the next filter. It applies the
+ * LimitRequestBody of the request's per-directory configuration, which
+ * was not known yet when the quick handler read the content.
+ */
+apr_status_t cache_query_replay_filter(ap_filter_t *f, apr_bucket_brigade *bb,
+                                       ap_input_mode_t mode,
+                                       apr_read_type_e block,
+                                       apr_off_t readbytes);
 
 #ifdef __cplusplus
 }

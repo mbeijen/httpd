@@ -1367,3 +1367,459 @@ const char *cache_table_getm(apr_pool_t *p, const apr_table_t *t,
         return apr_array_pstrcat(p, state.merged, ',');
     }
 }
+
+/*
+ * QUERY (RFC 10008) support: the cache key incorporates the request
+ * content and its metadata (Section 2.7).  The content is hashed with
+ * SHA-256, which apr-util 1.x does not provide, hence the small
+ * implementation below (FIPS 180-4).
+ */
+
+typedef struct {
+    apr_uint32_t h[8];
+    apr_uint64_t len;           /* total bytes */
+    unsigned char buf[64];
+    apr_size_t buflen;
+} cache_sha256_ctx;
+
+static const apr_uint32_t sha256_k[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+    0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+    0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+    0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+    0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+    0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+#define SHA256_ROTR(x, n) ((((x) >> (n)) | ((x) << (32 - (n)))) & 0xffffffff)
+
+static void sha256_init(cache_sha256_ctx *c)
+{
+    c->h[0] = 0x6a09e667; c->h[1] = 0xbb67ae85;
+    c->h[2] = 0x3c6ef372; c->h[3] = 0xa54ff53a;
+    c->h[4] = 0x510e527f; c->h[5] = 0x9b05688c;
+    c->h[6] = 0x1f83d9ab; c->h[7] = 0x5be0cd19;
+    c->len = 0;
+    c->buflen = 0;
+}
+
+static void sha256_block(cache_sha256_ctx *c, const unsigned char *p)
+{
+    apr_uint32_t w[64], v[8], s0, s1, t1, t2;
+    int i;
+
+    for (i = 0; i < 16; i++) {
+        w[i] = ((apr_uint32_t)p[4 * i] << 24) | ((apr_uint32_t)p[4 * i + 1] << 16)
+               | ((apr_uint32_t)p[4 * i + 2] << 8) | (apr_uint32_t)p[4 * i + 3];
+    }
+    for (; i < 64; i++) {
+        s0 = SHA256_ROTR(w[i - 15], 7) ^ SHA256_ROTR(w[i - 15], 18)
+             ^ (w[i - 15] >> 3);
+        s1 = SHA256_ROTR(w[i - 2], 17) ^ SHA256_ROTR(w[i - 2], 19)
+             ^ (w[i - 2] >> 10);
+        w[i] = (w[i - 16] + s0 + w[i - 7] + s1) & 0xffffffff;
+    }
+    for (i = 0; i < 8; i++) {
+        v[i] = c->h[i];
+    }
+    for (i = 0; i < 64; i++) {
+        s1 = SHA256_ROTR(v[4], 6) ^ SHA256_ROTR(v[4], 11)
+             ^ SHA256_ROTR(v[4], 25);
+        t1 = (v[7] + s1 + ((v[4] & v[5]) ^ (~v[4] & v[6])) + sha256_k[i]
+              + w[i]) & 0xffffffff;
+        s0 = SHA256_ROTR(v[0], 2) ^ SHA256_ROTR(v[0], 13)
+             ^ SHA256_ROTR(v[0], 22);
+        t2 = (s0 + ((v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2])))
+             & 0xffffffff;
+        v[7] = v[6];
+        v[6] = v[5];
+        v[5] = v[4];
+        v[4] = (v[3] + t1) & 0xffffffff;
+        v[3] = v[2];
+        v[2] = v[1];
+        v[1] = v[0];
+        v[0] = (t1 + t2) & 0xffffffff;
+    }
+    for (i = 0; i < 8; i++) {
+        c->h[i] = (c->h[i] + v[i]) & 0xffffffff;
+    }
+}
+
+static void sha256_update(cache_sha256_ctx *c, const void *data,
+                          apr_size_t len)
+{
+    const unsigned char *p = data;
+
+    c->len += len;
+    while (len > 0) {
+        apr_size_t n = 64 - c->buflen;
+
+        if (n > len) {
+            n = len;
+        }
+        memcpy(c->buf + c->buflen, p, n);
+        c->buflen += n;
+        p += n;
+        len -= n;
+        if (c->buflen == 64) {
+            sha256_block(c, c->buf);
+            c->buflen = 0;
+        }
+    }
+}
+
+static void sha256_final(cache_sha256_ctx *c, unsigned char digest[32])
+{
+    apr_uint64_t bits = c->len * 8;
+    unsigned char pad = 0x80;
+    unsigned char lenbuf[8];
+    int i;
+
+    sha256_update(c, &pad, 1);
+    pad = 0;
+    while (c->buflen != 56) {
+        sha256_update(c, &pad, 1);
+    }
+    for (i = 0; i < 8; i++) {
+        lenbuf[i] = (unsigned char)(bits >> (56 - 8 * i));
+    }
+    sha256_update(c, lenbuf, 8);
+    for (i = 0; i < 8; i++) {
+        digest[4 * i] = (unsigned char)(c->h[i] >> 24);
+        digest[4 * i + 1] = (unsigned char)(c->h[i] >> 16);
+        digest[4 * i + 2] = (unsigned char)(c->h[i] >> 8);
+        digest[4 * i + 3] = (unsigned char)c->h[i];
+    }
+}
+
+/* Lower-case the media type and coding names, drop optional whitespace;
+ * parameter values are kept as they are.
+ */
+static const char *query_key_field(apr_pool_t *p, const char *value)
+{
+    char *v, *s, *d;
+    int in_type = 1, quoted = 0;
+
+    if (!value) {
+        return "";
+    }
+    v = apr_pstrdup(p, value);
+    for (s = d = v; *s; ++s) {
+        if (*s == '"') {
+            quoted = !quoted;
+        }
+        else if (!quoted && (*s == ' ' || *s == '\t')) {
+            continue;
+        }
+        else if (!quoted && *s == ';') {
+            in_type = 0;
+        }
+        else if (!quoted && *s == ',') {
+            in_type = 1;
+        }
+        *d++ = in_type ? apr_tolower(*s) : *s;
+    }
+    *d = '\0';
+    return v;
+}
+
+#define CACHE_QUERY_REPLAY_KEY "mod_cache-query-replay"
+
+typedef struct {
+    apr_bucket_brigade *bb;     /* buffered content still to replay */
+    apr_status_t rv;            /* read error to report after the content */
+    apr_off_t length;           /* content read so far, buffered or not */
+    apr_off_t limit;            /* LimitRequestBody of the handler's config */
+    unsigned int started:1;     /* the handler has begun to read */
+    unsigned int too_large:1;   /* the content exceeds the limit */
+    char hex[65];               /* SHA-256 for the key, "" if not cacheable */
+} cache_query_replay_ctx;
+
+void cache_query_replay_insert(request_rec *r, ap_filter_rec_t *replay)
+{
+    cache_query_replay_ctx *ctx;
+    ap_filter_t *f;
+    void *data = NULL;
+
+    /* Only an internal redirect loses the filter; a subrequest has its
+     * own pool and inherits the input filters of its parent.
+     */
+    if (!r->prev) {
+        return;
+    }
+    apr_pool_userdata_get(&data, CACHE_QUERY_REPLAY_KEY, r->pool);
+    ctx = data;
+    if (!ctx || (ctx->started && !ctx->limit && ctx->rv == APR_SUCCESS
+                 && APR_BRIGADE_EMPTY(ctx->bb))) {
+        return;
+    }
+    for (f = r->input_filters; f; f = f->next) {
+        if (f->frec == replay) {
+            return;
+        }
+    }
+    /* the limit is that of the configuration of the new request */
+    ctx->started = 0;
+    ap_add_input_filter_handle(replay, ctx, r, r->connection);
+}
+
+int cache_query_key(cache_request_rec *cache, request_rec *r,
+                    cache_server_conf *conf, ap_filter_rec_t *replay)
+{
+    cache_query_replay_ctx *ctx;
+    cache_sha256_ctx sha;
+    apr_bucket_brigade *tmp;
+    const char *ctype, *cenc, *clen, *key = NULL;
+    unsigned char digest[32];
+    apr_off_t total = 0;
+    int seen_eos = 0;
+    apr_status_t rv;
+    void *data = NULL;
+    int i;
+
+    /* An internal redirect runs the cache again on the same request
+     * content: it was read and hashed the first time.
+     */
+    apr_pool_userdata_get(&data, CACHE_QUERY_REPLAY_KEY, r->pool);
+    if (data) {
+        ctx = data;
+        cache_query_replay_insert(r, replay);
+        if (!ctx->hex[0]) {
+            return DECLINED;
+        }
+        goto make_key;
+    }
+
+    ctype = apr_table_get(r->headers_in, "Content-Type");
+    if (!ctype) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(10682)
+                      "cache: QUERY without Content-Type not cached: %s",
+                      r->uri);
+        return DECLINED;
+    }
+    clen = apr_table_get(r->headers_in, "Content-Length");
+    if (clen) {
+        apr_off_t len;
+
+        if (!ap_parse_strict_length(&len, clen)
+            || len > conf->query_maxbody) {
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(10683)
+                          "cache: QUERY content length %s exceeds "
+                          "CacheQueryMaxBodySize, not cached: %s",
+                          clen, r->uri);
+            return DECLINED;
+        }
+    }
+
+    sha256_init(&sha);
+    ctype = query_key_field(r->pool, ctype);
+    cenc = query_key_field(r->pool,
+                           apr_table_get(r->headers_in, "Content-Encoding"));
+    sha256_update(&sha, ctype, strlen(ctype));
+    sha256_update(&sha, "\n", 1);
+    sha256_update(&sha, cenc, strlen(cenc));
+    sha256_update(&sha, "\n", 1);
+
+    /* Buffer the content (up to the limit), and replay it to the handler
+     * in any case, so that a request which cannot be cached still reaches
+     * the handler unchanged.
+     */
+    ctx = apr_pcalloc(r->pool, sizeof(*ctx));
+    ctx->bb = apr_brigade_create(r->pool, r->connection->bucket_alloc);
+    tmp = apr_brigade_create(r->pool, r->connection->bucket_alloc);
+    do {
+        rv = ap_get_brigade(r->input_filters, tmp, AP_MODE_READBYTES,
+                            APR_BLOCK_READ, HUGE_STRING_LEN);
+        if (rv != APR_SUCCESS) {
+            ctx->rv = rv;
+            break;
+        }
+        while (!APR_BRIGADE_EMPTY(tmp)) {
+            apr_bucket *e = APR_BRIGADE_FIRST(tmp);
+
+            if (APR_BUCKET_IS_EOS(e)) {
+                seen_eos = 1;
+            }
+            else if (!APR_BUCKET_IS_METADATA(e)) {
+                const char *data;
+                apr_size_t len;
+
+                rv = apr_bucket_read(e, &data, &len, APR_BLOCK_READ);
+                if (rv != APR_SUCCESS) {
+                    ctx->rv = rv;
+                    break;
+                }
+                sha256_update(&sha, data, len);
+                total += len;
+            }
+            rv = apr_bucket_setaside(e, r->pool);
+            if (rv != APR_SUCCESS && rv != APR_ENOTIMPL) {
+                ctx->rv = rv;
+                break;
+            }
+            APR_BUCKET_REMOVE(e);
+            APR_BRIGADE_INSERT_TAIL(ctx->bb, e);
+        }
+        apr_brigade_cleanup(tmp);
+    } while (!seen_eos && ctx->rv == APR_SUCCESS
+             && total <= conf->query_maxbody);
+
+    /* The request pool outlives internal redirects, which drop the
+     * filter: cache_query_replay_insert() finds the content here.
+     */
+    ctx->length = total;
+    apr_pool_userdata_setn(ctx, CACHE_QUERY_REPLAY_KEY, NULL, r->pool);
+    ap_add_input_filter_handle(replay, ctx, r, r->connection);
+
+    if (ctx->rv != APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, ctx->rv, r, APLOGNO(10684)
+                      "cache: reading QUERY content failed, not cached: %s",
+                      r->uri);
+        return DECLINED;
+    }
+    if (!seen_eos) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(10685)
+                      "cache: QUERY content exceeds CacheQueryMaxBodySize "
+                      "%" APR_OFF_T_FMT ", not cached: %s",
+                      conf->query_maxbody, r->uri);
+        return DECLINED;
+    }
+
+    sha256_final(&sha, digest);
+    for (i = 0; i < (int)sizeof(digest); i++) {
+        ctx->hex[2 * i] = "0123456789abcdef"[digest[i] >> 4];
+        ctx->hex[2 * i + 1] = "0123456789abcdef"[digest[i] & 0x0f];
+    }
+    ctx->hex[2 * sizeof(digest)] = '\0';
+
+make_key:
+    if (cache_generate_key(r, r->pool, &key) != APR_SUCCESS) {
+        return DECLINED;
+    }
+
+    /* A fragment never occurs in a request target, so this can not
+     * collide with the key of any GET request.
+     */
+    cache->key = apr_pstrcat(r->pool, key, "#query=", ctx->hex, NULL);
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(10686)
+                  "cache: Key for QUERY %s is %s", r->uri, cache->key);
+    return OK;
+}
+
+/* The content was read before the per-directory configuration of the
+ * request was known, with the LimitRequestBody of the server in effect.
+ * Apply the limit of the handler's configuration, like HTTP_IN does.
+ */
+static int query_replay_too_large(ap_filter_t *f, cache_query_replay_ctx *ctx,
+                                  apr_off_t length)
+{
+    if (ctx->limit && length > ctx->limit) {
+        ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, f->r, APLOGNO(10689)
+                      "cache: QUERY content length of %" APR_OFF_T_FMT
+                      " is larger than the configured limit of %"
+                      APR_OFF_T_FMT, length, ctx->limit);
+        ctx->too_large = 1;
+    }
+    return ctx->too_large;
+}
+
+apr_status_t cache_query_replay_filter(ap_filter_t *f, apr_bucket_brigade *bb,
+                                       ap_input_mode_t mode,
+                                       apr_read_type_e block,
+                                       apr_off_t readbytes)
+{
+    cache_query_replay_ctx *ctx = f->ctx;
+    apr_bucket *e, *copy;
+    apr_status_t rv;
+
+    if (!ctx) {
+        ap_remove_input_filter(f);
+        return ap_get_brigade(f->next, bb, mode, block, readbytes);
+    }
+    if (!ctx->started) {
+        const char *clen = apr_table_get(f->r->headers_in, "Content-Length");
+        apr_off_t length = ctx->length;
+
+        ctx->started = 1;
+        ctx->limit = ap_get_limit_req_body(f->r);
+        if (clen && (!ap_parse_strict_length(&length, clen)
+                     || length < ctx->length)) {
+            length = ctx->length;
+        }
+        query_replay_too_large(f, ctx, length);
+    }
+    if (ctx->too_large) {
+        return APR_ENOSPC;
+    }
+    if (APR_BRIGADE_EMPTY(ctx->bb) && ctx->rv == APR_SUCCESS) {
+        apr_off_t length = 0;
+
+        if (!ctx->limit) {
+            ap_remove_input_filter(f);
+            return ap_get_brigade(f->next, bb, mode, block, readbytes);
+        }
+        /* content beyond CacheQueryMaxBodySize, not buffered */
+        rv = ap_get_brigade(f->next, bb, mode, block, readbytes);
+        if (rv == APR_SUCCESS && mode != AP_MODE_SPECULATIVE
+            && apr_brigade_length(bb, 0, &length) == APR_SUCCESS
+            && length > 0) {
+            ctx->length += length;
+            if (query_replay_too_large(f, ctx, ctx->length)) {
+                apr_brigade_cleanup(bb);
+                return APR_ENOSPC;
+            }
+        }
+        return rv;
+    }
+    if (APR_BRIGADE_EMPTY(ctx->bb)) {
+        /* report the read error once, as it happened */
+        rv = ctx->rv;
+        ctx->rv = APR_SUCCESS;
+        return rv;
+    }
+
+    switch (mode) {
+    case AP_MODE_EXHAUSTIVE:
+        APR_BRIGADE_CONCAT(bb, ctx->bb);
+        return APR_SUCCESS;
+
+    case AP_MODE_GETLINE:
+        return apr_brigade_split_line(bb, ctx->bb, block, HUGE_STRING_LEN);
+
+    case AP_MODE_READBYTES:
+    case AP_MODE_SPECULATIVE:
+        rv = apr_brigade_partition(ctx->bb, readbytes, &e);
+        if (rv != APR_SUCCESS && rv != APR_INCOMPLETE) {
+            return rv;
+        }
+        if (mode == AP_MODE_SPECULATIVE) {
+            apr_bucket *b;
+
+            for (b = APR_BRIGADE_FIRST(ctx->bb); b != e;
+                 b = APR_BUCKET_NEXT(b)) {
+                rv = apr_bucket_copy(b, &copy);
+                if (rv != APR_SUCCESS) {
+                    return rv;
+                }
+                APR_BRIGADE_INSERT_TAIL(bb, copy);
+            }
+        }
+        else {
+            while (APR_BRIGADE_FIRST(ctx->bb) != e) {
+                apr_bucket *b = APR_BRIGADE_FIRST(ctx->bb);
+
+                APR_BUCKET_REMOVE(b);
+                APR_BRIGADE_INSERT_TAIL(bb, b);
+            }
+        }
+        return APR_SUCCESS;
+
+    default:
+        return ap_get_brigade(f->next, bb, mode, block, readbytes);
+    }
+}

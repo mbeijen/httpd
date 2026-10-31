@@ -1,0 +1,2 @@
+  *) mod_cache: Add CacheQuery and CacheQueryMaxBodySize to cache responses
+     to QUERY (RFC 10008) requests.  [Michiel W. Beijen]

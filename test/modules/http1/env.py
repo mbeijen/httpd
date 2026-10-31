@@ -17,7 +17,8 @@ class H1TestSetup(HttpdTestSetup):
     def __init__(self, env: 'HttpdTestEnv'):
         super().__init__(env=env)
         self.add_source_dir(os.path.dirname(inspect.getfile(H1TestSetup)))
-        self.add_modules(["cgid", "autoindex", "ssl", "reflector"])
+        self.add_modules(["cgid", "autoindex", "ssl", "reflector",
+                          "cache", "cache_disk", "rewrite"])
 
     def make(self):
         super().make()
