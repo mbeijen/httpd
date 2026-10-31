@@ -472,7 +472,8 @@ static int lua_ap_requestbody(lua_State *L)
             lua_pushliteral(L, "Request body was larger than the permitted size.");
             return 2;
         }
-        if (r->method_number != M_POST && r->method_number != M_PUT)
+        if (r->method_number != M_POST && r->method_number != M_PUT
+            && r->method_number != M_QUERY)
             return (0);
         if (!filename) {
             const char     *data;
