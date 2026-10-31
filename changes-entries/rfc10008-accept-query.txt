@@ -1,0 +1,3 @@
+  *) core: Add the AcceptQuery directive to announce the media types a
+     resource accepts as QUERY (RFC 10008) content in the Accept-Query
+     response header, and to answer others with 415.  [Michiel W. Beijen]

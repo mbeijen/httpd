@@ -192,6 +192,52 @@ AcceptFilter https connect
 </directivesynopsis>
 
 <directivesynopsis>
+<name>AcceptQuery</name>
+<description>Media types accepted as content of QUERY requests</description>
+<syntax>AcceptQuery <var>media-range</var> [<var>media-range</var>] ...|none</syntax>
+<contextlist><context>server config</context>
+<context>virtual host</context><context>directory</context>
+<context>.htaccess</context></contextlist>
+<override>FileInfo</override>
+<compatibility>Available in version 2.5.1 and later.</compatibility>
+
+<usage>
+    <p>This directive declares which media types the resources in its
+    scope accept as content of <code>QUERY</code> requests (<rfc>10008</rfc>).
+    A <var>media-range</var> is <code>type/subtype</code>,
+    <code>type/*</code>, or <code>*/*</code>, optionally followed by
+    parameters such as <code>;charset=utf-8</code>.</p>
+
+    <p>When it is set:</p>
+    <ul>
+    <li>All responses carry an <code>Accept-Query</code> header with the
+    media ranges, serialized as a Structured Field List (<rfc>9651</rfc>).</li>
+    <li>A <code>QUERY</code> request whose <code>Content-Type</code> matches
+    none of the media ranges fails with 415 (Unsupported Media Type) and
+    an <code>Accept</code> header that lists them. Parameters are not
+    compared, so <code>application/sql;charset=utf-8</code> also accepts
+    <code>application/sql</code> in any character set.</li>
+    </ul>
+
+    <p><code>AcceptQuery none</code> removes an inherited setting.</p>
+
+    <example>
+    <highlight language="config">
+&lt;Location "/contacts"&gt;
+    AcceptQuery application/x-www-form-urlencoded "application/sql; charset=utf-8"
+    ProxyPass "http://backend.example.com/contacts"
+&lt;/Location&gt;
+    </highlight>
+    </example>
+
+    <p>Independent of this directive, a <code>QUERY</code> request without
+    <code>Content-Type</code> fails with 400 (Bad Request) unless
+    <directive module="core">HttpProtocolOptions</directive>
+    <code>Unsafe</code> is set.</p>
+</usage>
+</directivesynopsis>
+
+<directivesynopsis>
 <name>AccessFileName</name>
 <description>Name of the distributed configuration file</description>
 <syntax>AccessFileName <var>filename</var> [<var>filename</var>] ...</syntax>

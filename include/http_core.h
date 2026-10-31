@@ -684,6 +684,11 @@ typedef struct {
     apr_hash_t *cgi_var_rules;
 
     apr_size_t read_buf_size;
+
+    /** AcceptQuery: media ranges (const char *) accepted as QUERY content
+     * (RFC 10008); NULL if unset, empty for "AcceptQuery none"
+     */
+    apr_array_header_t *accept_query;
 } core_dir_config;
 
 /* macro to implement off by default behaviour */

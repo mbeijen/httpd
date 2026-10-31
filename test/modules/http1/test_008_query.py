@@ -1,3 +1,4 @@
+import os
 import socket
 
 import pytest
@@ -168,3 +169,104 @@ class TestQueryUnsafe:
         assert r.response["status"] == 200
         assert r.json["method"] == "QUERY"
         assert r.json["content_type"] == ""
+
+
+def _configtest(env, lines):
+    conf_path = os.path.join(env.gen_dir, "query-configtest.conf")
+    with open(conf_path, 'w') as fd:
+        fd.write("\n".join([
+            f'ServerRoot "{env.server_dir}"',
+            f'Include "{os.path.join(env.server_conf_dir, "modules.conf")}"',
+            f'DocumentRoot "{env.server_docs_dir}"',
+            f'Listen {env.http_port2}',
+            f'<Directory "{env.server_docs_dir}">',
+        ] + lines + ['</Directory>', '']))
+    return env.run([os.path.join(env.bin_dir, 'httpd'), '-t', '-f', conf_path])
+
+
+class TestAcceptQuery:
+
+    @pytest.fixture(autouse=True, scope='class')
+    def _class_scope(self, env):
+        conf = H1Conf(env)
+        conf.add([
+            '<Location />',
+            '  AcceptQuery text/plain',
+            '</Location>',
+            '<Location /query.py>',
+            '  AcceptQuery application/x-www-form-urlencoded '
+            '"application/sql; charset=UTF-8" 3gpp/x "text/*;q=\\"a b\\""',
+            '</Location>',
+            '<Location /hello.py>',
+            '  AcceptQuery none',
+            '</Location>',
+        ])
+        conf.add_vhost_cgi()
+        conf.install()
+        assert env.apache_restart() == 0
+
+    # Accept-Query is a Structured Field List (RFC 10008, Section 3)
+    def test_h1_008_20(self, env):
+        r = env.curl_get(env.mkurl("https", "cgi", "/query.py"))
+        assert r.response["status"] == 200
+        assert r.response["header"]["accept-query"] == \
+            'application/x-www-form-urlencoded, application/sql;charset=UTF-8, ' \
+            '"3gpp/x", text/*;q="a b"'
+
+    # a listed media type is processed
+    @pytest.mark.parametrize("ctype", [
+        "application/x-www-form-urlencoded",
+        "Application/SQL; charset=utf-8",
+        "text/csv",
+    ])
+    def test_h1_008_21(self, env, ctype):
+        r = _query(env, "/query.py", ctype=ctype)
+        assert r.response["status"] == 200
+        assert r.json["method"] == "QUERY"
+        assert "accept-query" in r.response["header"]
+
+    # any other media type gets 415 with Accept (RFC 10008, Section 2.1)
+    def test_h1_008_22(self, env):
+        r = _query(env, "/query.py", ctype="application/json")
+        assert r.response["status"] == 415
+        assert r.response["header"]["accept"] == \
+            'application/x-www-form-urlencoded,application/sql; charset=UTF-8,' \
+            '3gpp/x,text/*;q="a b"'
+        assert "accept-query" in r.response["header"]
+
+    # other methods are not affected
+    def test_h1_008_23(self, env):
+        r = _query(env, "/query.py", method="POST", ctype="application/json")
+        assert r.response["status"] == 200
+
+    # "AcceptQuery none" switches off an inherited AcceptQuery
+    def test_h1_008_24(self, env):
+        r = env.curl_get(env.mkurl("https", "cgi", "/upload.py"))
+        assert r.response["header"]["accept-query"] == "text/plain"
+        r = env.curl_get(env.mkurl("https", "cgi", "/hello.py"))
+        assert r.response["status"] == 200
+        assert "accept-query" not in r.response["header"]
+
+    @pytest.mark.parametrize("value", [
+        "AcceptQuery",
+        "AcceptQuery none application/sql",
+        "AcceptQuery application",
+        "AcceptQuery */sql",
+        "AcceptQuery appl*/*",
+        "AcceptQuery application/s*",
+        "AcceptQuery application/sql;charset",
+        "AcceptQuery application/sql;1x=y",
+    ])
+    def test_h1_008_25(self, env, value):
+        r = _configtest(env, [value])
+        assert r.exit_code != 0, f"{value}: {r}"
+        assert "AcceptQuery" in r.stderr
+
+    @pytest.mark.parametrize("value", [
+        "AcceptQuery none",
+        "AcceptQuery */* text/*",
+        "AcceptQuery application/sql;charset=utf-8;x-y=\"1;2\"",
+    ])
+    def test_h1_008_26(self, env, value):
+        r = _configtest(env, [value])
+        assert r.exit_code == 0, f"{value}: {r}"

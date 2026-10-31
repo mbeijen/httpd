@@ -421,6 +421,10 @@ static void *merge_core_dir_configs(apr_pool_t *a, void *basev, void *newv)
         conf->read_buf_size = base->read_buf_size;
     }
 
+    if (new->accept_query) {
+        conf->accept_query = new->accept_query;
+    }
+
     if (new->allow_encoded_slashes_set) {
         conf->allow_encoded_slashes = new->allow_encoded_slashes;
     }
@@ -2349,6 +2353,35 @@ static const char *set_enable_sendfile(cmd_parms *cmd, void *d_,
         return "parameter must be 'on' or 'off'";
     }
 
+    return NULL;
+}
+
+static const char *set_accept_query(cmd_parms *cmd, void *d_,
+                                    const char *args)
+{
+    core_dir_config *d = d_;
+    apr_array_header_t *ranges = apr_array_make(cmd->pool, 4,
+                                                sizeof(const char *));
+    const char *range, *err;
+    int none = 0;
+
+    while (*(range = ap_getword_conf(cmd->pool, &args))) {
+        if (!ap_cstr_casecmp(range, "none")) {
+            none = 1;
+            continue;
+        }
+        if ((err = ap_accept_query_check(cmd->pool, range))) {
+            return apr_pstrcat(cmd->pool, "AcceptQuery: ", err, NULL);
+        }
+        APR_ARRAY_PUSH(ranges, const char *) = range;
+    }
+    if (none && ranges->nelts) {
+        return "AcceptQuery none must not be combined with media ranges";
+    }
+    if (!none && !ranges->nelts) {
+        return "AcceptQuery requires 'none' or at least one media range";
+    }
+    d->accept_query = ranges;
     return NULL;
 }
 
@@ -4957,6 +4990,9 @@ AP_INIT_FLAG("StrictHostCheck", set_core_server_flag,
              (void *)APR_OFFSETOF(core_server_config, strict_host_check),  
              RSRC_CONF,
              "Controls whether a hostname match is required"),
+AP_INIT_RAW_ARGS("AcceptQuery", set_accept_query, NULL, OR_FILEINFO,
+                 "media ranges accepted as content of QUERY requests "
+                 "(RFC 10008), or 'none'"),
 AP_INIT_TAKE1("ForceType", ap_set_string_slot_lower,
        (void *)APR_OFFSETOF(core_dir_config, mime_type), OR_FILEINFO,
      "a mime type that overrides other configured type"),
@@ -5110,6 +5146,34 @@ static int core_map_to_storage(request_rec *r)
 
 
 static int do_nothing(request_rec *r) { return OK; }
+
+/* RFC 10008: announce the media types of QUERY content that the resource
+ * accepts (Section 3), and answer a QUERY with any other media type with
+ * 415 (Unsupported Media Type) and the Accept field (Section 2.1).
+ */
+static int core_accept_query(request_rec *r)
+{
+    core_dir_config *conf = ap_get_core_module_config(r->per_dir_config);
+    const char *ctype;
+
+    if (r->main || !conf->accept_query || !conf->accept_query->nelts) {
+        return DECLINED;
+    }
+
+    ap_set_accept_query(r, conf->accept_query);
+
+    if (r->method_number == M_QUERY
+        && (ctype = apr_table_get(r->headers_in, "Content-Type"))
+        && !ap_accept_query_match(r->pool, conf->accept_query, ctype)) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(10681)
+                      "QUERY content of type '%s' not accepted by "
+                      "AcceptQuery", ctype);
+        apr_table_setn(r->err_headers_out, "Accept",
+                       apr_array_pstrcat(r->pool, conf->accept_query, ','));
+        return HTTP_UNSUPPORTED_MEDIA_TYPE;
+    }
+    return DECLINED;
+}
 
 static int core_override_type(request_rec *r)
 {
@@ -6172,6 +6236,7 @@ static void register_hooks(apr_pool_t *p)
     /* FIXME: I suspect we can eliminate the need for these do_nothings - Ben */
     ap_hook_type_checker(do_nothing,NULL,NULL,APR_HOOK_REALLY_LAST);
     ap_hook_fixups(core_override_type,NULL,NULL,APR_HOOK_REALLY_FIRST);
+    ap_hook_fixups(core_accept_query,NULL,NULL,APR_HOOK_MIDDLE);
     ap_hook_create_request(core_create_req, NULL, NULL, APR_HOOK_MIDDLE);
     APR_OPTIONAL_HOOK(proxy, create_req, core_create_proxy_req, NULL, NULL,
                       APR_HOOK_MIDDLE);

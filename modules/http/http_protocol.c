@@ -823,6 +823,245 @@ AP_DECLARE(int) ap_method_is_idempotent(int methnum)
     }
 }
 
+/* RFC 9110, Section 5.6.2 */
+static int is_tchar(int c)
+{
+    return apr_isalnum(c) || (c && strchr("!#$%&'*+-.^_`|~", c) != NULL);
+}
+
+/* RFC 9651, Section 3.3.4: sf-token */
+static int is_sf_token(const char *s)
+{
+    if (!apr_isalpha(*s) && *s != '*') {
+        return 0;
+    }
+    for (++s; *s; ++s) {
+        if (!is_tchar(*s) && *s != ':' && *s != '/') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Append s to the item list as sf-token, or as sf-string (RFC 9651,
+ * Section 3.3.3) when it is no valid token.
+ */
+static void append_sf_item(apr_pool_t *p, apr_array_header_t *out,
+                           const char *s)
+{
+    if (is_sf_token(s)) {
+        APR_ARRAY_PUSH(out, const char *) = s;
+    }
+    else {
+        char *q = apr_palloc(p, 2 * strlen(s) + 3), *d = q;
+
+        *d++ = '"';
+        for (; *s; ++s) {
+            if (*s == '"' || *s == '\\') {
+                *d++ = '\\';
+            }
+            *d++ = *s;
+        }
+        *d++ = '"';
+        *d = '\0';
+        APR_ARRAY_PUSH(out, const char *) = q;
+    }
+}
+
+/* Split "name=value" off a ';' separated parameter list.  The value may
+ * be a quoted-string (RFC 9110, Section 5.6.4).  Returns the position
+ * after the parameter, or NULL on a syntax error.
+ */
+static const char *next_media_param(apr_pool_t *p, const char *s,
+                                    const char **name, const char **value)
+{
+    const char *n, *v;
+    char *val, *d;
+
+    while (*s == ' ' || *s == '\t') ++s;
+    for (n = s; is_tchar(*s); ++s);
+    if (s == n || *s != '=') {
+        return NULL;
+    }
+    *name = apr_pstrmemdup(p, n, s - n);
+    ap_str_tolower((char *)*name);
+    ++s;
+    if (*s == '"') {
+        d = val = apr_palloc(p, strlen(s));
+        for (++s; *s && *s != '"'; ++s) {
+            if (*s == '\\' && s[1]) {
+                ++s;
+            }
+            if (*s < 0x20 || *s > 0x7e) {
+                return NULL;
+            }
+            *d++ = *s;
+        }
+        if (*s != '"') {
+            return NULL;
+        }
+        *d = '\0';
+        *value = val;
+        ++s;
+    }
+    else {
+        for (v = s; is_tchar(*s); ++s);
+        if (s == v) {
+            return NULL;
+        }
+        *value = apr_pstrmemdup(p, v, s - v);
+    }
+    while (*s == ' ' || *s == '\t') ++s;
+    if (*s == ';') {
+        ++s;
+    }
+    else if (*s) {
+        return NULL;
+    }
+    return s;
+}
+
+/* Split a media range into its lower-cased "type/subtype" and the
+ * parameters after it (or "").
+ */
+static const char *media_range_type(apr_pool_t *p, const char *range,
+                                    const char **params)
+{
+    const char *semi = ap_strchr_c(range, ';');
+    char *type;
+
+    if (semi) {
+        type = apr_pstrmemdup(p, range, semi - range);
+        *params = semi + 1;
+    }
+    else {
+        type = apr_pstrdup(p, range);
+        *params = "";
+    }
+    ap_cstr_stripws(type);
+    ap_str_tolower(type);
+    return type;
+}
+
+AP_DECLARE(const char *) ap_accept_query_check(apr_pool_t *p,
+                                               const char *media_range)
+{
+    const char *type, *params, *slash, *star, *c, *name, *value;
+
+    type = media_range_type(p, media_range, &params);
+    slash = ap_strchr_c(type, '/');
+    if (!slash || slash == type || !slash[1]) {
+        return apr_psprintf(p, "'%s' is no media range of the form "
+                            "type/subtype", media_range);
+    }
+    for (c = type; *c; ++c) {
+        if (c != slash && !is_tchar(*c)) {
+            return apr_psprintf(p, "invalid character in media range '%s'",
+                                media_range);
+        }
+    }
+    star = ap_strchr_c(type, '*');
+    if (star && strcmp(type, "*/*")
+        && (star < slash || strcmp(slash, "/*"))) {
+        return apr_psprintf(p, "only '*/*' and 'type/*' wildcards are "
+                            "allowed in media range '%s'", media_range);
+    }
+    while (*params) {
+        if (!(params = next_media_param(p, params, &name, &value))) {
+            return apr_psprintf(p, "invalid parameter in media range '%s'",
+                                media_range);
+        }
+        if (!apr_islower(*name) && *name != '*') {
+            return apr_psprintf(p, "parameter name '%s' in media range "
+                                "'%s' must start with a letter", name,
+                                media_range);
+        }
+        for (c = name; *c; ++c) {
+            if (!apr_islower(*c) && !apr_isdigit(*c)
+                && !ap_strchr_c("_-.*", *c)) {
+                return apr_psprintf(p, "parameter name '%s' in media range "
+                                    "'%s' is no valid key", name,
+                                    media_range);
+            }
+        }
+    }
+    return NULL;
+}
+
+AP_DECLARE(const char *) ap_make_accept_query(apr_pool_t *p,
+                                const apr_array_header_t *media_ranges)
+{
+    apr_array_header_t *items;
+    int i;
+
+    if (!media_ranges || apr_is_empty_array(media_ranges)) {
+        return NULL;
+    }
+    items = apr_array_make(p, media_ranges->nelts * 4, sizeof(const char *));
+    for (i = 0; i < media_ranges->nelts; ++i) {
+        const char *range = APR_ARRAY_IDX(media_ranges, i, const char *);
+        const char *type, *params, *name, *value;
+
+        if (i) {
+            APR_ARRAY_PUSH(items, const char *) = ", ";
+        }
+        type = media_range_type(p, range, &params);
+        append_sf_item(p, items, type);
+        while (*params
+               && (params = next_media_param(p, params, &name, &value))) {
+            APR_ARRAY_PUSH(items, const char *) = ";";
+            APR_ARRAY_PUSH(items, const char *) = name;
+            APR_ARRAY_PUSH(items, const char *) = "=";
+            append_sf_item(p, items, value);
+        }
+    }
+    return apr_array_pstrcat(p, items, '\0');
+}
+
+AP_DECLARE(void) ap_set_accept_query(request_rec *r,
+                                     const apr_array_header_t *media_ranges)
+{
+    const char *value = ap_make_accept_query(r->pool, media_ranges);
+
+    /* err_headers_out, so that it survives handlers that replace
+     * headers_out (e.g. mod_proxy) and goes out with a 415 as well.
+     */
+    apr_table_unset(r->headers_out, "Accept-Query");
+    if (value) {
+        apr_table_setn(r->err_headers_out, "Accept-Query", value);
+    }
+    else {
+        apr_table_unset(r->err_headers_out, "Accept-Query");
+    }
+}
+
+AP_DECLARE(int) ap_accept_query_match(apr_pool_t *p,
+                                      const apr_array_header_t *media_ranges,
+                                      const char *content_type)
+{
+    const char *ctype, *params;
+    int i;
+
+    if (!media_ranges || !content_type) {
+        return 0;
+    }
+    ctype = media_range_type(p, content_type, &params);
+    for (i = 0; i < media_ranges->nelts; ++i) {
+        const char *range = APR_ARRAY_IDX(media_ranges, i, const char *);
+        const char *type = media_range_type(p, range, &params);
+        apr_size_t len = strlen(type);
+
+        if (!strcmp(type, "*/*") || !strcmp(type, ctype)) {
+            return 1;
+        }
+        if (len > 2 && !strcmp(type + len - 2, "/*")
+            && !strncmp(type, ctype, len - 1)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /*
  * Turn a known method number into a name.
  */

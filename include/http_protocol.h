@@ -830,6 +830,53 @@ AP_DECLARE(int) ap_method_is_safe(int methnum);
  */
 AP_DECLARE(int) ap_method_is_idempotent(int methnum);
 
+/**
+ * Check whether a media range is acceptable for the Accept-Query field
+ * (RFC 10008, Section 3): "type/subtype", "type/&#42;" or "*&#47;*", optionally
+ * followed by ";name=value" parameters.
+ * @param p Pool for the error message
+ * @param media_range The media range
+ * @return NULL if valid, an error message otherwise
+ */
+AP_DECLARE(const char *) ap_accept_query_check(apr_pool_t *p,
+                                               const char *media_range);
+
+/**
+ * Serialize media ranges as an Accept-Query field value, a Structured
+ * Field List (RFC 9651) of Tokens or Strings with parameters.
+ * @param p Pool to allocate the value from
+ * @param media_ranges Array of (const char *) media ranges, each valid
+ *        according to ap_accept_query_check()
+ * @return The field value, or NULL if media_ranges is NULL or empty
+ */
+AP_DECLARE(const char *) ap_make_accept_query(apr_pool_t *p,
+                                const apr_array_header_t *media_ranges);
+
+/**
+ * Set the Accept-Query response header field (RFC 10008, Section 3)
+ * to the given media ranges, replacing any earlier value such as that
+ * of the AcceptQuery directive. The field is set in r->err_headers_out,
+ * so that it is sent with error responses like 415 as well.
+ * @param r The current request
+ * @param media_ranges Array of (const char *) media ranges, see
+ *        ap_make_accept_query(); NULL or empty removes the field
+ */
+AP_DECLARE(void) ap_set_accept_query(request_rec *r,
+                                     const apr_array_header_t *media_ranges);
+
+/**
+ * Check whether a Content-Type matches one of the given media ranges.
+ * Parameters of both are ignored; "*&#47;*" and "type/&#42;" match as in the
+ * Accept field.
+ * @param p Pool for temporary allocations
+ * @param media_ranges Array of (const char *) media ranges
+ * @param content_type The Content-Type value, e.g. of a QUERY request
+ * @return 1 if it matches, 0 otherwise
+ */
+AP_DECLARE(int) ap_accept_query_match(apr_pool_t *p,
+                                      const apr_array_header_t *media_ranges,
+                                      const char *content_type);
+
 
 /* Hooks */
 /*

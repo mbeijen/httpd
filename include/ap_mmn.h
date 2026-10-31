@@ -747,6 +747,10 @@
  * 20261031.0 (2.5.1-dev)  Add M_QUERY (RFC 10008) to httpd.h, which moves
  *                         M_INVALID from 26 to 27; add ap_method_is_safe()
  *                         and ap_method_is_idempotent() to http_protocol.h
+ * 20261031.1 (2.5.1-dev)  Add accept_query to core_dir_config; add
+ *                         ap_accept_query_check(), ap_make_accept_query(),
+ *                         ap_set_accept_query() and ap_accept_query_match()
+ *                         to http_protocol.h
  */
 
 #define MODULE_MAGIC_COOKIE 0x41503235UL /* "AP25" */
@@ -754,7 +758,7 @@
 #ifndef MODULE_MAGIC_NUMBER_MAJOR
 #define MODULE_MAGIC_NUMBER_MAJOR 20261031
 #endif
-#define MODULE_MAGIC_NUMBER_MINOR 0              /* 0...n */
+#define MODULE_MAGIC_NUMBER_MINOR 1              /* 0...n */
 
 /**
  * Determine if the server's current MODULE_MAGIC_NUMBER is at least a
